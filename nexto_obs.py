@@ -1,10 +1,9 @@
+from collections import Counter
 from typing import Any
+
 import numpy as np
-from game_state import GameState
-from player_data import PlayerData
-import ctypes as ctypes
-from game_structs import Entity
-from physics_object import PhysicsObject
+from rlgym_compat.common_values import BLUE_TEAM, ORANGE_TEAM
+from rlgym_compat.game_state import GameState, PlayerData
 
 BOOST_LOCATIONS = (
     (0.0, -4240.0, 70.0),
@@ -124,6 +123,8 @@ class BatchedObsBuilder:
         raise NotImplementedError
 
     def add_actions(self, obs: Any, previous_actions: np.ndarray, player_index=None):
+        # Modify current obs to include action
+        # player_index=None means actions for all players should be provided
         raise NotImplementedError
 
     def _reset(self, initial_state: GameState):
@@ -166,30 +167,23 @@ class NextoObsBuilder(BatchedObsBuilder):
     _invert = np.array([1] * 5 + [-1, -1, 1] * 5 + [1] * 4)
     _norm = np.array([1.] * 5 + [2300] * 6 + [1] * 6 + [5.5] * 3 + [1] * 4)
 
-    def __init__(self, n_players=None, n_boosts=None, buffer_cursor=None):
+    def __init__(self, field_info=None, n_players=None, tick_skip=8):
         super().__init__()
         self.n_players = n_players
-        self.n_boosts = n_boosts
-        self._boost_locations = np.empty([n_boosts, 3])
-        # self._boost_locations =  np.array(BOOST_LOCATIONS)
+        self.demo_timers = None
+        self.boost_timers = None
+        self.tick_skip = tick_skip
+        if field_info is None:
+            self._boost_locations = np.array(BOOST_LOCATIONS)
+            self._boost_types = self._boost_locations[:, 2] > 72
+        else:
+            self._boost_locations = np.array([[bp.location.x, bp.location.y, bp.location.z]
+                                              for bp in field_info.boost_pads[:field_info.num_boosts]])
+            self._boost_types = np.array([bp.is_full_boost for bp in field_info.boost_pads[:field_info.num_boosts]])
 
-        entity_size = ctypes.sizeof(Entity)
-        buffer_cursor += 20 + entity_size
-
-        # Get Boosts
-        for i in range(n_boosts):
-            entity = Entity.from_address(buffer_cursor)
-            buffer_cursor += entity_size
-            location = entity.Physics.location
-            testing = [location.x, location.y, location.z]
-            self._boost_locations[i] = [location.x, location.y, location.z]
-
-        boosts_heights = self._boost_locations[:, 2]
-        boosts_heights_min = np.amin(boosts_heights)
-        boosts_heights_max = np.amax(boosts_heights)
-
-        self._boost_types = abs(boosts_heights - boosts_heights_max) < abs(boosts_heights - boosts_heights_min)
-        test = 0
+    def _reset(self, initial_state: GameState):
+        self.demo_timers = np.zeros(len(initial_state.players))
+        self.boost_timers = np.zeros(len(initial_state.boost_pads))
 
     @staticmethod
     def _quats_to_rot_mtx(quats: np.ndarray) -> np.ndarray:
@@ -253,7 +247,7 @@ class NextoObsBuilder(BatchedObsBuilder):
 
         n_players = (encoded_states.shape[1] - players_start_index) // player_length
         lim_players = n_players if self.n_players is None else self.n_players
-        n_entities = lim_players + 1 + self.n_boosts
+        n_entities = lim_players + 1 + 34
 
         # SELECTORS
         sel_players = slice(0, lim_players)
@@ -272,15 +266,16 @@ class NextoObsBuilder(BatchedObsBuilder):
         # BOOSTS
         kv[:, :, sel_boosts, IS_BOOST] = 1
         kv[:, :, sel_boosts, POS] = self._boost_locations
-        kv[:, :, sel_boosts, BOOST] = 0.12 + 0.88 * self._boost_types
-        kv[:, :, sel_boosts, DEMO] = encoded_states[:, 3:3 + self.n_boosts]  # FIXME boost timer
+        kv[:, :, sel_boosts, BOOST] = 0.12 + 0.88 * (self._boost_locations[:, 2] > 72)
+        kv[:, :, sel_boosts, DEMO] = encoded_states[:, 3:3 + 34]  # FIXME boost timer
 
         # PLAYERS
         teams = encoded_states[0, players_start_index + 1::player_length]
         kv[:, :, :n_players, IS_MATE] = 1 - teams  # Default team is blue
         kv[:, :, :n_players, IS_OPP] = teams
         for i in range(n_players):
-            encoded_player = encoded_states[:, players_start_index + i * player_length: players_start_index + (i + 1) * player_length]
+            encoded_player = encoded_states[:,
+                             players_start_index + i * player_length: players_start_index + (i + 1) * player_length]
 
             kv[i, :, i, IS_SELF] = 1
             kv[:, :, i, POS] = encoded_player[:, 2: 5]  # TODO constants for these indices
@@ -319,6 +314,3 @@ class NextoObsBuilder(BatchedObsBuilder):
         else:
             q, kv, m = obs[player_index]
             q[:, 0, ACTIONS] = previous_actions
-
-    def _reset(self, initial_state: GameState):
-        return
